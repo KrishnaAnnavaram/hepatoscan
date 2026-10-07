@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hepatoscan"
+version = "0.1.0"
+description = "Attention U-Net liver tumor segmentation with a patient-care chatbot"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Krishna Annavaram" }]
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "scikit-learn>=1.3",
+    "pydantic>=2.5",
+]
+
+[project.optional-dependencies]
+torch = ["torch>=2.1"]
+nifti = ["nibabel>=5.0"]
+api = ["fastapi>=0.110", "uvicorn>=0.29"]
+image = ["pillow>=10.0"]
+all = ["hepatoscan[torch,nifti,api,image]"]
+dev = ["pytest>=8", "fastapi>=0.110", "httpx>=0.27"]
+
+[project.scripts]
+hepatoscan = "hepatoscan.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+hepatoscan = ["assistant/kb/*.md", "service/static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+filterwarnings = ["ignore:Could not find the number of physical cores:UserWarning"]

@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hepatoscan</title>
+</head>
+<body style="font-family: system-ui, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem;">
+<h1>hepatoscan</h1>
+<p><strong>Research and education tool. Not a medical device. Not a diagnosis.</strong>
+A clinician must review every result.</p>
+<label>API token <input id="token" type="password" autocomplete="off"></label>
+<h2>Segment a CT volume</h2>
+<p>Accepted files: .npz, .nii, .nii.gz. The server keeps no copy of the file.</p>
+<input id="file" type="file" accept=".npz,.nii,.gz">
+<button id="send">Segment</button>
+<pre id="summary"></pre>
+<img id="overlay" alt="overlay of the segmentation on one slice" style="max-width: 100%;">
+<h2>Ask the assistant</h2>
+<div id="log"></div>
+<input id="question" style="width: 80%;" maxlength="2000" placeholder="Ask a general question">
+<button id="ask">Ask</button>
+<button id="end">End conversation</button>
+<script src="/app.js"></script>
+</body>
+</html>
