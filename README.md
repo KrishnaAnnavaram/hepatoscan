@@ -9,7 +9,7 @@
 ![Labels](https://img.shields.io/badge/Labels-background_%7C_liver_%7C_tumor-1F3864?style=for-the-badge)
 ![Segmenters](https://img.shields.io/badge/Segmenters-voxel_GBM_%7C_attention_U--Net-2E5FD9?style=for-the-badge)
 ![Metrics](https://img.shields.io/badge/Metrics-Dice_%7C_HD95_%7C_lesion_F1-6E86E8?style=for-the-badge)
-![Tests](https://img.shields.io/badge/Tests-66_passing-3DA35B?style=for-the-badge)
+![Tests](https://img.shields.io/badge/Tests-59_passing_in_CI-3DA35B?style=for-the-badge)
 ![Offline demo](https://img.shields.io/badge/Offline_demo-Yes-F5C542?style=for-the-badge)
 ![License](https://img.shields.io/badge/License-MIT-A0399B?style=for-the-badge)
 
@@ -105,7 +105,7 @@ hepatoscan gives each of these questions its own component and its own tests.
 | Providers | PyTorch (U-Net), nibabel (NIfTI), FastAPI (service), any OpenAI-compatible LLM. All optional |
 | Offline mode | Phantoms, the baseline segmenter, evaluation, the service logic and the extractive assistant |
 | Safety | Strict checkpoint loading, CT-only uploads, no stored uploads, red-flag escalation, diagnosis refusal |
-| Tests | **66** unit tests (`pytest`). In CI, 59 pass and 7 skip (torch and nibabel) |
+| Tests | **66** unit tests (`pytest`): 59 pass in CI, 7 skip without `torch` and `nibabel` (all 66 pass with the `all` extra) |
 
 ```mermaid
 flowchart LR
@@ -477,7 +477,7 @@ Phantoms: 30 cases of 24×64×64 voxels, seed 0. Split: 18 train, 4 validation, 
 
 Pixel accuracy is above 0.99 for both segmenters, but the tumor Dice differs by 0.2. This shows why pixel accuracy is not a segmentation metric. With 8 test volumes the intervals are wide. The phantoms are easy, so these numbers are an upper bound for this code, not an estimate for real CT.
 
-The prototype reported only pixel accuracy, and its service probably ran with random weights. There is no prototype number to compare.
+The prototype reported only pixel accuracy (prototype result, not reproduced here). Thus there is no prototype Dice value to compare.
 
 ---
 
@@ -528,7 +528,7 @@ Read these problems before you use hepatoscan in any setting with real patients.
 | **segmenter** | A component that returns a mask: `voxel-gbm` or `attention-unet-2.5d` |
 | **checkpoint** | A `.pt` file with the weights, the U-Net config and the preprocessing config |
 | **summary** | Liver volume, lesion count and lesion volume of one mask |
-| **Dice** | `2 |A ∩ B| / (|A| + |B|)` for a predicted region A and a true region B |
+| **Dice** | `2 \|A ∩ B\| / (\|A\| + \|B\|)` for a predicted region A and a true region B |
 | **HD95** | 95th percentile of the symmetric surface distance, in mm |
 | **red flag** | A phrase that can describe an emergency |
 | **escalation** | The fixed message that tells the user to get urgent care |
