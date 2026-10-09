@@ -69,6 +69,7 @@ This README is the **one location that explains all of hepatoscan**. It gives th
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one upload](#42-the-life-cycle-of-one-upload)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🔵 [Data and preprocessing](#5-data-and-preprocessing)
 6. 🟢 [The segmenters](#6-the-segmenters)
 7. 🟣 [The service and the assistant](#7-the-service-and-the-assistant)
@@ -134,6 +135,72 @@ flowchart LR
 | Assistant | `src/hepatoscan/assistant/` | Knowledge base, BM25, safety rules, LLM adapters, sessions |
 | CLI | `src/hepatoscan/cli.py` | The `hepatoscan` command |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    subgraph ENTRY["Entry points"]
+        CLI["cli.py<br/>hepatoscan command"]
+        API["service/api.py<br/>FastAPI app, api extra"]
+    end
+    subgraph DATAIN["Data in"]
+        CFG["config.py<br/>Settings"]
+        SYN["synthetic.py<br/>write_dataset, load_dataset"]
+        SPL["splits.py<br/>split_cases"]
+        VOL["volume.py<br/>Volume, load_file"]
+        LAB["labels.py<br/>validate_mask, resize_mask"]
+    end
+    subgraph SEGM["Segment and measure"]
+        PRE["preprocess.py<br/>preprocess_volume"]
+        BASE["baseline.py<br/>VoxelBaseline"]
+        UNET["models/<br/>AttentionUNet, TorchSegmenter"]
+        POST["postprocess.py<br/>clean_mask"]
+        SEG["segmenter.py<br/>segment, summarize"]
+        OVL["overlay.py<br/>overlay_rgb, to_png"]
+        EVA["evaluate.py, metrics.py<br/>evaluate, volume_metrics"]
+    end
+    subgraph SERV["Service"]
+        HND["service/handlers.py<br/>Service"]
+        VAL["service/validation.py<br/>validate_upload"]
+        AUD["service/audit.py<br/>AuditLog"]
+    end
+    subgraph ASSIST["Assistant"]
+        CHAT["assistant/chat.py<br/>Assistant, SessionStore"]
+        KB["assistant/kb.py, retriever.py<br/>load_kb, BM25"]
+        SAFE["assistant/safety.py<br/>triage"]
+        LLM["assistant/llm.py<br/>make_llm"]
+    end
+
+    CLI --> CFG
+    CLI --> SYN
+    CLI --> SPL
+    CLI --> BASE
+    CLI --> UNET
+    CLI --> EVA
+    CLI --> SEG
+    CLI --> CHAT
+    CLI -- "serve" --> API
+    API --> HND
+    HND --> VAL
+    HND --> SEG
+    HND --> OVL
+    HND --> AUD
+    HND --> CHAT
+    VAL --> VOL
+    SYN --> VOL
+    VOL --> LAB
+    EVA --> SEG
+    SEG --> PRE
+    PRE --> LAB
+    BASE --> PRE
+    BASE --> POST
+    UNET --> PRE
+    UNET --> POST
+    CHAT --> KB
+    CHAT --> SAFE
+    CHAT --> LLM
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -174,6 +241,20 @@ hepatoscan/
 ### 3.1 One model definition and strict loading
 `models/unet.py` holds the only U-Net definition. A checkpoint stores the U-Net config and the preprocessing config with the weights. `load_checkpoint` uses `strict=True` and raises `CheckpointError` on any mismatch, so the service never runs random weights.
 
+```mermaid
+flowchart LR
+    TR["train<br/>best weights"] --> SAVE["save_checkpoint"]
+    SAVE --> PT[("unet.pt<br/>state_dict, unet_config, preprocess")]
+    PT --> LOAD["load_checkpoint<br/>torch.load, weights_only"]
+    LOAD --> CFG["UNetConfig and PreprocessConfig<br/>model_validate"]
+    CFG --> BUILD["build the AttentionUNet<br/>from UNetConfig"]
+    BUILD --> STRICT{"load_state_dict<br/>strict=True passes?"}
+    STRICT -- "no, or a key is absent" --> ERR[/"CheckpointError<br/>serving stops"/]
+    STRICT -- "yes" --> WIN{"CT windows match<br/>in_windows?"}
+    WIN -- "no" --> ERR
+    WIN -- "yes" --> OK[/"TorchSegmenter"/]
+```
+
 ### 3.2 Three labels from end to end
 Masks keep 0 = background, 1 = liver, 2 = tumor. `validate_mask` refuses fractional and unknown values. `resize_mask` uses nearest-neighbour sampling only. The U-Net uses a softmax head with cross-entropy plus Dice.
 
@@ -202,22 +283,66 @@ The session history lives on the server, with a turn cap and a time limit. The p
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    SRC["LiTS cases or phantoms"] --> MAN["manifest.csv + .npz"]
-    MAN --> SPLIT["per-case split (seeded)"]
-    SPLIT --> PRE["preprocess_volume"]
+flowchart TD
+    SRC[/"LiTS cases or phantoms"/] --> MAN[("manifest.csv + .npz")]
+    MAN --> SPLIT["split_cases: per case, seeded"]
+    SPLIT -- "train" --> PRE["preprocess_volume"]
     PRE --> TB["train baseline (voxel-gbm)"]
     PRE --> TU["train attention U-Net (torch)"]
-    TB --> EV["evaluate: Dice, HD95, lesion F1"]
-    TU --> CK["checkpoint: weights + configs"]
+    SPLIT -- "val" --> TU
+    TB --> PKL[("baseline.pkl + SHA-256 manifest")]
+    TU --> CK[("unet.pt: weights + configs")]
+    SPLIT -- "test" --> EV["evaluate: Dice, HD95, lesion F1"]
+    PKL --> EV
     CK --> EV
-    CK --> SRV["service: strict load"]
-    UP["upload .npz / .nii / .nii.gz"] --> VAL["validate"] --> PRE2["preprocess_volume"] --> SRV
-    SRV --> SUM["summary + overlay"]
-    SUM --> AS["assistant: retrieve, safety, cite"]
+    EV --> REP[/"eval report JSON"/]
+    PKL --> SRV["service: strict load of the segmenter"]
+    CK --> SRV
+    UP[/"upload .npz / .nii / .nii.gz"/] --> VAL{"token and validate_upload pass?"}
+    VAL -- "no" --> REJ[/"401, 503 or 422"/]
+    VAL -- "yes" --> SEG["segment: preprocess_volume,<br/>predict, clean_mask, restore_shape"]
+    SRV --> SEG
+    SEG --> SUM[/"summary + overlay"/]
+    SUM --> AUD[("audit.jsonl")]
+    SUM --> AS["assistant: triage, retrieve, cite"]
+    Q[/"question"/] --> AS
+    AS --> ANS[/"answer with citations"/]
+    SUM --> HUMAN{{"HUMAN<br/>clinician reviews the mask,<br/>the numbers and the answers"}}
+    ANS --> HUMAN
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
 ```
 
 ### 4.2 The life cycle of one upload
+
+```mermaid
+stateDiagram-v2
+    state "Bytes received" as Received
+    state "Token accepted" as Authorized
+    state "Volume validated" as Validated
+    state "Prepared volume" as Prepared
+    state "Clean label mask" as Cleaned
+    state "Mask on original grid" as Restored
+    state "Summary and overlay" as Summarized
+    state "Clinician review" as Review
+    [*] --> Received: POST /segment with X-Filename
+    Received --> TooLarge: content-length above the limit, 413
+    Received --> Authorized: check_token
+    Received --> NoAuth: token absent or wrong 401, no token set 503
+    Authorized --> Validated: validate_upload
+    Authorized --> segment_rejected: size, extension, magic bytes or volume check fails, 422
+    Validated --> Prepared: preprocess_volume
+    Prepared --> Cleaned: predict_prepared, then clean_mask
+    Cleaned --> Restored: restore_shape, nearest neighbour
+    Restored --> Summarized: summarize, overlay_rgb
+    Summarized --> segment_ok: audit record written
+    segment_ok --> Review: response returned, upload dropped
+    Review --> [*]
+    TooLarge --> [*]
+    NoAuth --> [*]
+    segment_rejected --> [*]
+```
 
 1. The client sends the bytes to `/segment` with the bearer token and an `X-Filename` header.
 2. The service checks the token with a constant-time comparison.
@@ -230,11 +355,80 @@ flowchart TB
 9. The service writes one audit record and returns the summary and the overlay.
 10. Nothing of the upload stays on the server after the response.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as Clinician or researcher
+    participant PG as Static page app.js
+    participant API as FastAPI app
+    participant SVC as Service handlers
+    participant SEG as Segmenter
+    participant AUD as AuditLog
+    participant AS as Assistant
+    participant LLM as LLM, optional
+
+    U->>PG: choose a CT file, type the token
+    PG->>API: POST /segment, bytes, Authorization, X-Filename
+    API->>API: content-length check
+    API->>SVC: segment_upload(body, x_filename, authorization)
+    SVC->>SVC: check_token, then validate_upload
+    SVC->>SEG: segment(segmenter, vol)
+    SEG-->>SVC: mask and SegmentationSummary
+    SVC->>SVC: overlay_rgb, to_png
+    SVC->>AUD: write segment_ok with content id, size, summary
+    SVC-->>PG: summary and overlay_png_base64
+    U->>PG: ask a question
+    PG->>API: POST /chat with question, session_id, summary_text
+    API->>SVC: chat(payload, authorization)
+    SVC->>AS: ask(question, session_id, summary_text)
+    AS->>AS: triage, then BM25 search
+    AS->>LLM: complete(messages)
+    LLM-->>AS: answer text
+    AS->>AS: valid_markers, diagnostic claim check, refusal, disclaimer
+    AS-->>SVC: Reply
+    SVC->>AUD: write chat with escalated, refused, citation count
+    SVC-->>PG: answer, citations, flags, session_id
+    PG-->>U: summary, overlay and answer
+    U->>PG: End the session
+    PG->>API: DELETE /chat/session_id
+    API->>SVC: end_chat, the session is deleted
+```
+
 ---
 
 ## 5. Data and preprocessing
 
 **Purpose.** Give every segmenter the same, checked input.
+
+```mermaid
+flowchart LR
+    SYN["synthetic.write_dataset<br/>make_phantom, seeded"] --> DIR[("data folder<br/>manifest.csv, case_XXX.npz")]
+    LITS[/"converted LiTS cases<br/>see data/README.md"/] --> DIR
+    DIR --> LD["load_dataset<br/>case_id and file columns"]
+    LD --> LF["load_file<br/>.npz, .nii, .nii.gz"]
+    LF --> CHK{"Volume checks pass?<br/>3-D, 8 to 1024 voxels,<br/>HU range, spacing, labels 0, 1, 2"}
+    CHK -- "no" --> ERR[/"VolumeError or LabelError"/]
+    CHK -- "yes" --> MK{"mask present?"}
+    MK -- "no" --> ERR2[/"ValueError: no mask"/]
+    MK -- "yes" --> SP["split_cases<br/>seeded, per case"]
+    SP --> OUT[/"train, val and test case ids"/]
+```
+
+```mermaid
+flowchart LR
+    IN[/"Volume<br/>HU array, spacing, mask"/] --> TS{"target_spacing set?"}
+    TS -- "yes" --> RS["resample to 2.5, 1.5, 1.5 mm<br/>image linear, mask nearest"]
+    TS -- "no" --> CL
+    RS --> CL["clip to -1024, 1024 HU"]
+    CL --> W1["liver window<br/>level 60, width 200"]
+    CL --> W2["abdomen window<br/>level 40, width 400"]
+    W1 --> ST["stack the channels<br/>C, D, H, W in 0 to 1"]
+    W2 --> ST
+    ST --> OUT[/"Prepared"/]
+    OUT --> S25["slice_stack, context 1<br/>2.5-D input for the U-Net"]
+```
 
 | Input | Output |
 |---|---|
@@ -259,6 +453,45 @@ flowchart TB
 ## 6. The segmenters
 
 **Purpose.** Return a label mask for a prepared volume.
+
+```mermaid
+flowchart TD
+    TR[/"training volumes with masks"/] --> P1["preprocess_volume"]
+    P1 --> F1["voxel_features: 7 features"]
+    P1 --> SMP["sample_voxels<br/>at most per_class for each label, seeded"]
+    F1 --> FIT["Pipeline fit<br/>StandardScaler, HistGradientBoostingClassifier"]
+    SMP --> FIT
+    FIT --> SAVE[("baseline.pkl + baseline.json<br/>with SHA-256 value")]
+    SAVE --> LOAD{"SHA-256 matches<br/>the manifest?"}
+    LOAD -- "no" --> ERR[/"ValueError, no load"/]
+    LOAD -- "yes" --> PROBA["predict_proba"]
+    NEW[/"prepared volume"/] --> F2["voxel_features"]
+    F2 --> PROBA
+    PROBA --> SM["smooth each label probability<br/>3x3x3 uniform filter"]
+    SM --> AM["take the largest probability"]
+    AM --> CM["clean_mask<br/>lesions below 10 voxels removed"]
+    CM --> OUT[/"label mask 0, 1, 2"/]
+```
+
+```mermaid
+flowchart TD
+    TR[/"training volumes"/] --> PV["preprocess_volume"]
+    PV --> SL["slices_of: 2.5-D slices<br/>keep 20 % of slices without liver"]
+    SL --> FT["fit_to: crop or pad to 96x96"]
+    FT --> EP["one epoch: Adam, batches of 8<br/>dice_ce_loss"]
+    VA[/"validation volumes"/] --> VS
+    EP --> VS["segment the validation volumes<br/>mean of liver Dice and tumor Dice"]
+    VS --> BEST{"score better<br/>than the best?"}
+    BEST -- "yes" --> KEEP["keep the weights<br/>reset the counter"]
+    BEST -- "no" --> BAD{"patience 3 reached?"}
+    KEEP --> MORE{"more epochs?"}
+    BAD -- "no" --> MORE
+    MORE -- "yes" --> EP
+    BAD -- "yes" --> LOADB["load the best weights"]
+    MORE -- "no" --> LOADB
+    LOADB --> CK["save_checkpoint"]
+    CK --> OUT[("unet.pt + unet.json history")]
+```
 
 | Segmenter | Module | Needs | Method |
 |---|---|---|---|
@@ -292,22 +525,62 @@ flowchart TB
 
 **Purpose.** Give the segmentation and general information to a user with clear limits.
 
+```mermaid
+flowchart TD
+    REQ[/"HTTP request"/] --> R{"endpoint"}
+    R -- "GET /health, /, /app.js" --> OPEN[/"status, page or script<br/>no token"/]
+    R -- "POST /segment" --> LEN{"content-length above<br/>the upload limit?"}
+    LEN -- "yes" --> E413[/"413"/]
+    LEN -- "no" --> TOK
+    R -- "POST /chat, DELETE /chat" --> TOK{"check_token"}
+    TOK -- "no token set" --> E503[/"503"/]
+    TOK -- "absent or wrong" --> E401[/"401"/]
+    TOK -- "valid" --> H["Service handler<br/>segment_upload, chat, end_chat"]
+    H -- "UploadError or ValueError" --> E422[/"422"/]
+    H -- "segment and chat events" --> AUD[("audit.jsonl")]
+    H -- "success" --> OUT[/"JSON response<br/>no-store, nosniff, CSP headers"/]
+```
+
 | Endpoint | Token | Input | Output |
 |---|---|---|---|
 | `GET /health` | No | none | status, segmenter name, LLM name |
 | `GET /` | No | none | static page |
+| `GET /app.js` | No | none | script of the static page |
 | `POST /segment` | Yes | raw bytes, `X-Filename` header | summary, overlay PNG (base64) |
 | `POST /chat` | Yes | JSON `question`, optional `session_id`, `summary_text` | answer, citations, flags |
 | `DELETE /chat/{session_id}` | Yes | none | `deleted` |
 
 **Assistant procedure**
 
+```mermaid
+flowchart TD
+    Q[/"question, session_id, summary_text"/] --> LEN{"empty or longer<br/>than 2000 characters?"}
+    LEN -- "yes" --> ERR[/"ValueError, 422"/]
+    LEN -- "no" --> SESS["SessionStore.get<br/>remove old sessions, new id if needed"]
+    SESS --> TRI{"triage: red flag?"}
+    TRI -- "yes" --> ESC[/"escalation message<br/>no model call"/]
+    TRI -- "no" --> BM["BM25 search<br/>k 3, minimum score 0.5"]
+    BM --> HIT{"any passage?"}
+    HIT -- "no" --> NOI[/"no-information message,<br/>refusal first if diagnosis request"/]
+    HIT -- "yes" --> MSG["build messages: rules, passages,<br/>summary, history, question"]
+    MSG --> GEN["llm.complete, then valid_markers"]
+    GEN --> OKC{"call OK, valid citation<br/>and no diagnostic claim?"}
+    OKC -- "no" --> FB["OfflineLLM extractive answer,<br/>else no-information message"]
+    OKC -- "yes" --> DIAG
+    FB --> DIAG{"diagnosis request?"}
+    DIAG -- "yes" --> REF["refusal first"]
+    DIAG -- "no" --> SRC
+    REF --> SRC["add the source list<br/>and the disclaimer"]
+    SRC --> SAVE["add_exchange to the session"]
+    SAVE --> OUT[/"Reply: answer, citations, flags"/]
+```
+
 1. Reject an empty question or a question longer than 2000 characters.
 2. If the question has a red flag, return the escalation message. Do not call the model.
 3. Retrieve up to 3 passages with BM25. If there is no passage, return the no-information message.
 4. Build the messages: the rules, the numbered passages, the scan summary (marked as not a diagnosis), the capped history and the question once.
 5. Call the model. Remove citation markers that point to no passage.
-6. If the answer has no valid citation or has a diagnostic claim, use the extractive answer.
+6. If the model call fails, or the answer has no valid citation or has a diagnostic claim, use the extractive answer.
 7. If the question asks for a diagnosis, a prognosis or a dose, put the refusal first.
 8. Add the source list and the disclaimer. Save the exchange in the session.
 
@@ -316,6 +589,22 @@ flowchart TB
 ## 8. The metrics, safety and service rules
 
 **Metrics.**
+
+```mermaid
+flowchart LR
+    PR[/"predicted mask"/] --> VM["volume_metrics"]
+    GT[/"true mask and spacing"/] --> VM
+    VM --> RG["liver region: label 1 or 2<br/>tumor region: label 2"]
+    RG --> DI["dice, iou"]
+    RG --> HD["hd95 in mm<br/>surface distance"]
+    RG --> LS["lesion_stats<br/>26-connected components"]
+    RG --> PA["pixel_accuracy,<br/>volume errors in mL"]
+    DI --> BS["bootstrap_mean_ci<br/>2000 resamples, non-finite left out"]
+    HD --> BS
+    LS --> BS
+    PA --> BS
+    BS --> OUT[/"summary: mean, ci_low, ci_high,<br/>plus tumor_dice_cases_with_tumor"/]
+```
 
 | Metric | Definition |
 |---|---|
@@ -338,6 +627,32 @@ Each summary gives the mean over volumes and a 95% percentile bootstrap interval
 | No passage | question outside the knowledge base | No-information message, no model call |
 
 **Service rules.**
+
+The upload check in `validation.py` accepts a file only if its content matches its extension.
+
+```mermaid
+flowchart TD
+    IN[/"bytes and X-Filename"/] --> EMP{"empty or above<br/>the upload limit?"}
+    EMP -- "yes" --> ERR[/"UploadError, 422"/]
+    EMP -- "no" --> EXT{"extension"}
+    EXT -- "other" --> ERR
+    EXT -- ".npz" --> ZIP{"ZIP magic bytes?"}
+    EXT -- ".nii.gz" --> GZ{"gzip magic bytes?"}
+    EXT -- ".nii" --> NI{"NIfTI-1 header?"}
+    GZ -- "yes" --> DEC["decompress, limit<br/>8 times the upload limit"]
+    DEC --> BIG{"too large?"}
+    BIG -- "yes" --> ERR
+    BIG -- "no" --> NI
+    ZIP -- "no" --> ERR
+    GZ -- "no" --> ERR
+    NI -- "no" --> ERR
+    ZIP -- "yes" --> LNPZ["load_npz_bytes"]
+    NI -- "yes" --> LNII["load_nifti_bytes"]
+    LNPZ --> VC{"Volume checks pass?"}
+    LNII --> VC
+    VC -- "no" --> ERR
+    VC -- "yes" --> OUT[/"Volume in memory"/]
+```
 
 | Rule | Value |
 |---|---|
@@ -415,6 +730,27 @@ hepatoscan ask "What does the lesion count mean?" --summary results/case_000/cas
 hepatoscan serve --model results/baseline.pkl --host 127.0.0.1 --port 8000
 ```
 
+The diagram shows the order of the commands and the files that connect them.
+
+```mermaid
+flowchart LR
+    INS["pip install -e .[dev]<br/>or .[all]"] --> SYN["hepatoscan synth"]
+    SYN --> DATA[("data/synthetic<br/>manifest.csv, case_XXX.npz")]
+    DATA --> TB["hepatoscan train-baseline"]
+    DATA --> TU["hepatoscan train-unet<br/>torch extra"]
+    TB --> PKL[("results/baseline.pkl,<br/>split.json")]
+    TU --> PT[("results/unet.pt,<br/>unet.json")]
+    PKL --> EV["hepatoscan evaluate"]
+    PT --> EV
+    DATA --> EV
+    EV --> EVJ[("results/eval_model_split.json")]
+    PKL --> SG["hepatoscan segment"]
+    SG --> SUMJ[("case summary JSON,<br/>mask, overlay PNG")]
+    SUMJ --> ASK["hepatoscan ask --summary"]
+    PKL --> SRV["hepatoscan serve<br/>api extra"]
+    INS --> DEMO["hepatoscan demo<br/>temporary folder"]
+```
+
 ### 10.4 Environment variables
 
 | Variable | Used by | Meaning |
@@ -435,6 +771,18 @@ hepatoscan serve --model results/baseline.pkl --host 127.0.0.1 --port 8000
 | `HEPATOSCAN_SESSION_TTL_S` | assistant | Session time limit in seconds. Default `1800` |
 
 The CLI reads a local `.env` file for these names. A variable that is already set wins. Credentials are only in the local `.env` file. Git ignores this file. Do not print or commit credentials.
+
+```mermaid
+flowchart LR
+    ENV[/".env file"/] --> LD["load_dotenv<br/>known names only, set variables win"]
+    PENV[/"process environment"/] --> SFE["settings_from_env"]
+    LD --> SFE
+    SFE --> VAL{"Settings validation<br/>pydantic, extra forbid"}
+    VAL -- "valid" --> SET[/"Settings"/]
+    VAL -- "not valid" --> ERR[/"ValidationError, the command stops"/]
+    SET --> DEV["resolve_device<br/>auto: cuda if available, else cpu"]
+    SET --> LLM["make_llm<br/>offline or openai"]
+```
 
 ---
 
